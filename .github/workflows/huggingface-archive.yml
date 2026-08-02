@@ -33,7 +33,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: pip
 
       - name: Install transfer clients
         run: python -m pip install --disable-pip-version-check "boto3>=1.40,<2" "huggingface_hub[hf_xet]>=0.34,<2" "requests>=2.32,<3"
