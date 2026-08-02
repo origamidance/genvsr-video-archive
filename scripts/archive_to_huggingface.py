@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -122,33 +123,67 @@ def download_file(item: dict, destination: Path) -> None:
         raise RuntimeError(f"Size mismatch for {item['key']}: {actual} != {item['size']}")
 
 
-def remote_size(path_in_repo: str) -> int | None:
-    try:
-        entries = hf.get_paths_info(HF_REPOSITORY, [path_in_repo], repo_type="dataset")
-        return int(entries[0].size) if entries else None
-    except Exception:  # noqa: BLE001 - absence and transient metadata errors both trigger safe upload
-        return None
-
-
-def upload_with_retry(local_path: Path, item: dict) -> None:
-    if remote_size(item["path"]) == int(item["size"]):
-        return
-    for attempt in range(6):
+def remote_sizes(paths: list[str]) -> dict[str, int]:
+    sizes: dict[str, int] = {}
+    for index in range(0, len(paths), 100):
+        batch = paths[index : index + 100]
         try:
-            hf.upload_file(
-                path_or_fileobj=str(local_path),
-                path_in_repo=item["path"],
+            entries = hf.get_paths_info(HF_REPOSITORY, batch, repo_type="dataset")
+        except Exception:  # noqa: BLE001 - missing paths and transient metadata errors trigger a safe upload
+            continue
+        for entry in entries:
+            path = getattr(entry, "path", "")
+            size = getattr(entry, "size", None)
+            if path and size is not None:
+                sizes[path] = int(size)
+    return sizes
+
+
+def hf_retry_delay(error: Exception, attempt: int) -> int:
+    message = str(error)
+    if "repository commits" in message and "128 per hour" in message:
+        return 65 * 60
+    match = re.search(r"retry after\s+(\d+)\s+seconds", message, flags=re.IGNORECASE)
+    if match:
+        return min(int(match.group(1)) + 5, 65 * 60)
+    return min(2**attempt * 15, 5 * 60)
+
+
+def upload_folder_with_retry(folder: Path) -> None:
+    for attempt in range(8):
+        try:
+            hf.upload_folder(
+                folder_path=str(folder),
                 repo_id=HF_REPOSITORY,
                 repo_type="dataset",
-                commit_message=f"Archive {FAMILY_ID} v{VERSION}: {Path(item['path']).name}",
+                commit_message=f"Archive {FAMILY_ID} v{VERSION}",
+                ignore_patterns=[".cache/**"],
             )
-            if remote_size(item["path"]) != int(item["size"]):
-                raise RuntimeError("remote size verification failed")
             return
-        except Exception as exc:  # noqa: BLE001 - Xet/network retries are intentionally broad
-            if attempt == 5:
-                raise RuntimeError(f"Unable to upload {item['path']}: {exc}") from exc
-            time.sleep(min(2**attempt, 30))
+        except Exception as exc:  # noqa: BLE001 - honor Hub limits and retry transient Xet/network failures
+            if attempt == 7:
+                raise RuntimeError(f"Unable to upload dataset folder: {exc}") from exc
+            delay = hf_retry_delay(exc, attempt)
+            print(f"Hugging Face upload paused for {delay}s: {exc}", flush=True)
+            time.sleep(delay)
+
+
+def upload_manifest_with_retry(payload: bytes, path_in_repo: str):
+    for attempt in range(8):
+        try:
+            return hf.upload_file(
+                path_or_fileobj=io.BytesIO(payload),
+                path_in_repo=path_in_repo,
+                repo_id=HF_REPOSITORY,
+                repo_type="dataset",
+                commit_message=f"Publish manifest for {FAMILY_ID} v{VERSION}",
+            )
+        except Exception as exc:  # noqa: BLE001 - final metadata commit must survive rate limits too
+            if attempt == 7:
+                raise RuntimeError(f"Unable to publish dataset manifest: {exc}") from exc
+            delay = hf_retry_delay(exc, attempt)
+            print(f"Hugging Face manifest commit paused for {delay}s: {exc}", flush=True)
+            time.sleep(delay)
 
 
 def encode_hf_proxy(path: str, revision: str) -> str:
@@ -160,9 +195,9 @@ def encode_hf_proxy(path: str, revision: str) -> str:
     )
 
 
-def write_dataset_card() -> None:
+def write_dataset_card(folder: Path) -> bool:
     if hf.file_exists(HF_REPOSITORY, "README.md", repo_type="dataset"):
-        return
+        return False
     card = """---
 license: other
 task_categories:
@@ -179,13 +214,8 @@ Public video inputs and restoration outputs used by the GenVSR Visual Comparator
 Each immutable experiment version contains aligned MP4 sources, posters, and a manifest.
 Please consult the individual version manifest for source labels and comparison defaults.
 """
-    hf.upload_file(
-        path_or_fileobj=io.BytesIO(card.encode("utf-8")),
-        path_in_repo="README.md",
-        repo_id=HF_REPOSITORY,
-        repo_type="dataset",
-        commit_message="Add GenVSR dataset card",
-    )
+    (folder / "README.md").write_text(card, encoding="utf-8")
+    return True
 
 
 def update_catalog(job: dict) -> None:
@@ -210,25 +240,36 @@ def main() -> None:
         return
 
     hf.create_repo(HF_REPOSITORY, repo_type="dataset", private=False, exist_ok=True)
-    write_dataset_card()
     with tempfile.TemporaryDirectory(prefix="genvsr-hf-") as temp_directory:
         temp_root = Path(temp_directory)
+        include_card = write_dataset_card(temp_root)
+        paths = [item["path"] for item in job["files"]]
+        existing = remote_sizes(paths)
+        pending: list[dict] = []
         for item in job["files"]:
-            if item.get("status") == "uploaded" and remote_size(item["path"]) == int(item["size"]):
+            if existing.get(item["path"]) == int(item["size"]):
+                item["status"] = "uploaded"
                 continue
             item["status"] = "downloading"
             item["attempts"] = int(item.get("attempts", 0)) + 1
             update_job(job, "downloading", current=item["path"])
-            local_path = temp_root / Path(item["path"]).name
+            local_path = temp_root / item["path"]
             download_file(item, local_path)
             item["sha256"] = sha256_file(local_path)
-            item["status"] = "uploading"
-            update_job(job, "uploading", current=item["path"])
-            upload_with_retry(local_path, item)
+            item["status"] = "ready"
+            pending.append(item)
+
+        if pending or include_card:
+            update_job(job, "uploading", current=f"{len(pending)} files in one batched upload")
+            upload_folder_with_retry(temp_root)
+
+        verified = remote_sizes(paths)
+        for item in job["files"]:
+            if verified.get(item["path"]) != int(item["size"]):
+                raise RuntimeError(f"Remote size verification failed for {item['path']}")
             item["status"] = "uploaded"
-            item["uploadedAt"] = now()
-            local_path.unlink(missing_ok=True)
-            update_job(job, "uploading")
+            item["uploadedAt"] = item.get("uploadedAt") or now()
+        update_job(job, "uploading")
 
     update_job(job, "finalizing")
     media_revision = hf.dataset_info(HF_REPOSITORY).sha
@@ -253,12 +294,9 @@ def main() -> None:
         "bytesFreed": int(job["totalBytes"]) if job.get("sourceProvider") == "r2" else 0,
         "sourceProvider": job.get("sourceProvider", "r2"),
     }
-    commit = hf.upload_file(
-        path_or_fileobj=io.BytesIO(json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")),
-        path_in_repo=f"{prefix}/manifest.json",
-        repo_id=HF_REPOSITORY,
-        repo_type="dataset",
-        commit_message=f"Publish manifest for {FAMILY_ID} v{VERSION}",
+    commit = upload_manifest_with_retry(
+        json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+        f"{prefix}/manifest.json",
     )
     manifest_revision = commit.oid
     version_url = f"{repository_url}/tree/{manifest_revision}/{prefix}"
