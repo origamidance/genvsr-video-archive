@@ -141,16 +141,16 @@ def remote_sizes(paths: list[str]) -> dict[str, int]:
 
 def hf_retry_delay(error: Exception, attempt: int) -> int:
     message = str(error)
-    if "repository commits" in message and "128 per hour" in message:
-        return 65 * 60
     match = re.search(r"retry after\s+(\d+)\s+seconds", message, flags=re.IGNORECASE)
     if match:
         return min(int(match.group(1)) + 5, 65 * 60)
+    if "repository commits" in message and "128 per hour" in message:
+        return 65 * 60
     return min(2**attempt * 15, 5 * 60)
 
 
 def upload_folder_with_retry(folder: Path) -> None:
-    for attempt in range(8):
+    for attempt in range(16):
         try:
             hf.upload_folder(
                 folder_path=str(folder),
@@ -161,7 +161,7 @@ def upload_folder_with_retry(folder: Path) -> None:
             )
             return
         except Exception as exc:  # noqa: BLE001 - honor Hub limits and retry transient Xet/network failures
-            if attempt == 7:
+            if attempt == 15:
                 raise RuntimeError(f"Unable to upload dataset folder: {exc}") from exc
             delay = hf_retry_delay(exc, attempt)
             print(f"Hugging Face upload paused for {delay}s: {exc}", flush=True)
@@ -169,7 +169,7 @@ def upload_folder_with_retry(folder: Path) -> None:
 
 
 def upload_manifest_with_retry(payload: bytes, path_in_repo: str):
-    for attempt in range(8):
+    for attempt in range(16):
         try:
             return hf.upload_file(
                 path_or_fileobj=io.BytesIO(payload),
@@ -179,7 +179,7 @@ def upload_manifest_with_retry(payload: bytes, path_in_repo: str):
                 commit_message=f"Publish manifest for {FAMILY_ID} v{VERSION}",
             )
         except Exception as exc:  # noqa: BLE001 - final metadata commit must survive rate limits too
-            if attempt == 7:
+            if attempt == 15:
                 raise RuntimeError(f"Unable to publish dataset manifest: {exc}") from exc
             delay = hf_retry_delay(exc, attempt)
             print(f"Hugging Face manifest commit paused for {delay}s: {exc}", flush=True)
