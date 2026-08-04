@@ -1,0 +1,51 @@
+name: Pin GenVSR dataset to R2
+
+on:
+  repository_dispatch:
+    types: [r2-pin]
+  workflow_dispatch:
+    inputs:
+      family_id:
+        description: Dataset family UUID
+        required: true
+        type: string
+      version:
+        description: Dataset version
+        required: true
+        type: string
+
+concurrency:
+  group: r2-pin-${{ github.event.client_payload.family_id || inputs.family_id }}-v${{ github.event.client_payload.version || inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  pin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Check out archive automation
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install transfer clients
+        run: python -m pip install --disable-pip-version-check "boto3>=1.40,<2" "huggingface_hub[hf_xet]>=0.34,<2"
+
+      - name: Restore and verify immutable dataset version
+        env:
+          FAMILY_ID: ${{ github.event.client_payload.family_id || inputs.family_id }}
+          VERSION: ${{ github.event.client_payload.version || inputs.version }}
+          HF_DATASET_REPOSITORY: ${{ vars.HF_DATASET_REPOSITORY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          HF_XET_HIGH_PERFORMANCE: '1'
+        run: python scripts/pin_to_r2.py
