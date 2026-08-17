@@ -17,6 +17,7 @@ from urllib.parse import quote
 
 import boto3
 import requests
+from botocore.exceptions import ClientError
 from huggingface_hub import HfApi
 
 
@@ -59,6 +60,16 @@ def get_json(key: str) -> dict:
     return json.loads(response["Body"].read())
 
 
+def get_json_if_exists(key: str) -> dict | None:
+    try:
+        return get_json(key)
+    except ClientError as error:
+        code = str(error.response.get("Error", {}).get("Code", ""))
+        if code in {"NoSuchKey", "NotFound", "404"}:
+            return None
+        raise
+
+
 def put_json(key: str, value: dict) -> None:
     value["updatedAt"] = now()
     s3.put_object(
@@ -77,6 +88,64 @@ def update_job(job: dict, status: str, *, current: str = "", error: str = "") ->
     put_json(JOB_KEY, job)
     completed = sum(1 for item in job.get("files", []) if item.get("status") == "uploaded")
     print(f"[{status}] {completed}/{len(job.get('files', []))} {current}", flush=True)
+
+
+def bootstrap_archive_job() -> dict:
+    """Rebuild a missing archive job from the immutable R2 manifest."""
+    manifest = get_json(MANIFEST_KEY)
+    source_provider = (manifest.get("storage") or {}).get("provider") or "r2"
+    if source_provider != "r2":
+        raise RuntimeError(f"Cannot bootstrap an archive job from {source_provider}")
+
+    keys: dict[str, str] = {}
+    for sequence in manifest.get("sequences", []):
+        poster_key = sequence.get("posterKey")
+        if poster_key:
+            keys.setdefault(poster_key, "image/jpeg")
+        for media in sequence.get("sources", {}).values():
+            media_key = media.get("key")
+            if media_key:
+                keys.setdefault(media_key, "video/mp4")
+    if not keys:
+        raise RuntimeError("Manifest does not contain any media files")
+
+    files = []
+    for key, content_type in keys.items():
+        metadata = s3.head_object(Bucket=R2_BUCKET_NAME, Key=key)
+        size = int(metadata.get("ContentLength", 0))
+        if size <= 0:
+            raise RuntimeError(f"Unable to determine archive file size: {key}")
+        files.append(
+            {
+                "key": key,
+                "path": key,
+                "size": size,
+                "contentType": content_type,
+                "status": "pending",
+                "attempts": 0,
+            }
+        )
+
+    created_at = now()
+    job = {
+        "schemaVersion": 1,
+        "provider": "huggingface",
+        "familyId": FAMILY_ID,
+        "version": VERSION,
+        "label": manifest.get("label", FAMILY_ID),
+        "datasetRepository": HF_REPOSITORY,
+        "actionsRepository": os.environ.get("GITHUB_REPOSITORY", ""),
+        "sourceProvider": source_provider,
+        "status": "pending",
+        "createdAt": created_at,
+        "updatedAt": created_at,
+        "createdBy": manifest.get("createdBy", "github-actions"),
+        "totalBytes": sum(item["size"] for item in files),
+        "files": files,
+    }
+    put_json(JOB_KEY, job)
+    print(f"Bootstrapped missing archive job with {len(files)} files.", flush=True)
+    return job
 
 
 def sha256_file(path: Path) -> str:
@@ -232,7 +301,7 @@ def update_catalog(job: dict) -> None:
 
 
 def main() -> None:
-    job = get_json(JOB_KEY)
+    job = get_json_if_exists(JOB_KEY) or bootstrap_archive_job()
     if job.get("datasetRepository") != HF_REPOSITORY:
         raise RuntimeError("Archive job targets a different Hugging Face repository")
     if job.get("status") == "completed":
